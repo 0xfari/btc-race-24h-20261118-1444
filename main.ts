@@ -1,166 +1,198 @@
-// SPDX-License-Identifier: MIT
-// btc-race-24h-20261118-1444 — washout-bounce bot for cbBTC/USDC, 1-minute bars.
+// cbBTC dip-recovery bot — make.fun btc-race-24h-20261118-1444.
 //
-// Idea, in one paragraph: on 1-minute BTC almost every signal is
-// negative-expectancy after the ~26 bps round-trip cost, so the bot does
-// almost nothing. It waits for a genuine 4-hour washout (close 2% or more
-// below the close 240 bars ago, while sitting within 3% of the 120-bar
-// Donchian low), buys the whole stack once, and rides the slow mean
-// reversion with a 1.5% take-profit, a 0.8% trailing stop from the running
-// peak, a 1% hard stop from the blended fill, and a 360-bar max hold.
-// After one losing round trip it stands down for the rest of the day:
-// one bad washout is information, two is a trend. If nothing has traded
-// by bar 1080 it buys 35% blind as guardrail insurance (at least one
-// trade, max drawdown far under the 25% bar) with a 1% take-profit, a
-// 0.8% trail and a 120-bar hold. No entry before bar 122, none in the
-// last 30 bars, 30 bars of cooldown after an exit. Deterministic: the
-// only state is bar history and fill reports, never the clock or the
-// environment.
+// The hello message hands us one symbol (CBBTC) and 1,000 USDC of paper
+// money; from then on every batch brings one fresh one-minute bar and we
+// answer with our orders for it. The idea is simple: cbBTC drops hard and
+// then climbs back over the next hours, so the bot waits out the fall and
+// only buys after the price has turned.
+//
+//   Watch: track the highest close of the last 31 bars. Once a close
+//     prints 180 bps or more below that high, the dip is "primed" and we
+//     start watching the lowest close since the prime.
+//   Buy: when a later close bounces 5 bps or more off that low, spend
+//     all cash on CBBTC.
+//   Sell: take-profit at +250 bps over the buy's cost, stop-loss at
+//     -100 bps, or 480 bars after the buy — whichever comes first.
+//   Safety net: if bar 1200 passes with no trade at all, take one small
+//     $200 trade on a 60 bps dip with the same 5 bps bounce, exiting at
+//     +/-60 bps or after 100 bars, so the entry still clears the race
+//     guardrail (at least one trade) with a bounded worst case.
+//
+// Every comparison is exact integer arithmetic on closes (price scale 5)
+// and on the position's own cost basis. No wall clock, no randomness, no
+// network, no files — the only input is the batch, so both graded runs
+// agree byte for byte.
 
 import { runBars } from './vendor/makefun-bars.ts';
+import type { BarsState, Batch, OrderInput } from './vendor/makefun-bars.ts';
 
-const SYM = 'CBBTC';
-const SLIP_BPS = 500;
+const ASSET = 'CBBTC';
+const BPS = 10_000n;
 
-// --- washout leg (R) ---
-const R_RET240 = -0.02; // 240-bar return at or below -2%
-const R_BOUNCE_LO = 0.0; // within [0%, 3%] above the Donchian low (120)
-const R_BOUNCE_HI = 0.03;
-const R_TP = 0.015;
-const R_TRAIL = 0.008;
-const R_SL = -0.01;
-const R_HOLD = 360;
+// How far the close must fall from the rolling high before we prime.
+const HIGH_WINDOW = 31; // current bar plus the 30 before it
+const PRIME_DROP_BPS = 180n;
+const TURN_BOUNCE_BPS = 5n;
 
-// --- late insurance leg (I) ---
-const I_BAR = 1080; // only when zero trades and zero fills so far
-const I_SIZE_NUM = 35n; // 35% of cash
-const I_SIZE_DEN = 100n;
-const I_TP = 0.01;
-const I_TRAIL = 0.008;
-const I_HOLD = 120;
+// How a main-rule trade is exited.
+const WIN_BPS = 250n;
+const LOSE_BPS = 100n;
+const HOLD_LIMIT_BARS = 480;
 
-// --- shared risk rules ---
-const MIN_BAR = 122;
-const LAST_ENTRY_BAR = 1409; // no entry in the last 30 bars
-const COOLDOWN = 30;
-const MAX_LOSSES = 1; // stand down after one losing round trip
-const MAX_TRADES = 8;
+// Safety-net trade, only if the window is nearly over with no trade yet.
+const NET_START_BAR = 1200;
+const NET_DROP_BPS = 60n;
+const NET_SIZE_QUOTE = 200_000_000n; // $200, in USDC quote units (6dp)
+const NET_WIN_BPS = 60n;
+const NET_LOSE_BPS = 60n;
+const NET_HOLD_BARS = 100;
 
-const closes: number[] = []; // close per seq, as float USDC (price_scale 5)
-const lows: number[] = []; // low per seq
+// Fills land roughly 10 bps from the close; 300 bps never binds.
+const SLIPPAGE_CAP_BPS = 300;
 
-let entryPrice = 0; // blended fill price of the open position (float)
-let entryQty = 0n; // total qty filled into the open position
-let entrySeq = -1; // seq of the fill bar that opened the position
-let entrySpent = 0n; // total buy notional spent on the open position
-let peak = 0; // highest close since entry
-let leg: 'R' | 'I' | null = null;
-let losses = 0;
-let lastExitSeq = -100000;
-let trades = 0; // closed round trips
-let fills = 0; // filled orders (buys + sells)
-let pendingLeg: 'R' | 'I' | null = null; // leg of the buy decided last batch
-
-function donchianLow(n: number): number {
-  let m = Infinity;
-  const start = Math.max(0, lows.length - n);
-  for (let i = start; i < lows.length; i++) if (lows[i] < m) m = lows[i];
-  return m;
+interface DipWatch {
+  primed: boolean;
+  low: bigint;
+  spent: boolean;
 }
 
-await runBars({
-  onBatch(state, batch) {
-    const bar = batch.bars[0];
-    if (bar !== undefined) {
-      closes.push(Number(bar.c) / 1e5);
-      lows.push(Number(bar.l) / 1e5);
+interface LiveTrade {
+  openedAt: number;
+  winBps: bigint;
+  loseBps: bigint;
+  holdBars: number;
+}
+
+const history: bigint[] = [];
+const mainWatch: DipWatch = { primed: false, low: 0n, spent: false };
+const netWatch: DipWatch = { primed: false, low: 0n, spent: false };
+let trade: LiveTrade | null = null;
+let everTraded = false;
+
+// Highest close over the trailing window, or null while history is short.
+function recentHigh(): bigint | null {
+  if (history.length < HIGH_WINDOW) return null;
+  return history.slice(history.length - HIGH_WINDOW).reduce((a, b) => (b > a ? b : a));
+}
+
+// True when `price` sits at least `bps` below `ref`.
+function downBy(price: bigint, ref: bigint, bps: bigint): boolean {
+  return price * BPS <= ref * (BPS - bps);
+}
+
+// True when `price` sits at least `bps` above `ref`.
+function upBy(price: bigint, ref: bigint, bps: bigint): boolean {
+  return price * BPS >= ref * (BPS + bps);
+}
+
+// One dip watch step: prime on a deep enough drop, then buy on the turn.
+// Returns a buy order when the bounce fires, else null.
+function watchStep(
+  watch: DipWatch,
+  close: bigint,
+  high: bigint,
+  dropBps: bigint,
+  sizeQuote: bigint,
+  winBps: bigint,
+  loseBps: bigint,
+  holdBars: number,
+  barIdx: number,
+): OrderInput | null {
+  if (watch.primed) {
+    if (close <= watch.low) {
+      watch.low = close;
+      return null;
     }
-    const seq = state.seq;
-
-    // Fold in this batch's fills: buys set/extend the entry, sells close it.
-    for (const f of batch.fills) {
-      if (f.status !== 'filled') continue;
-      fills++;
-      if (f.side === 'buy') {
-        const q = BigInt(f.qty);
-        const p = Number(f.price) / 1e5;
-        entryPrice = entryQty === 0n ? p : (entryPrice * Number(entryQty) + p * Number(q)) / Number(entryQty + q);
-        entryQty += q;
-        entrySpent += BigInt(f.notional_quote_units);
-        entrySeq = seq;
-        peak = Math.max(peak, closes[closes.length - 1]);
-        if (leg === null) leg = pendingLeg;
-      } else {
-        // Sell proceeds minus everything spent on this position = round-trip PnL.
-        const proceeds = BigInt(f.notional_quote_units);
-        if (state.positions.get(SYM) === undefined) {
-          trades++;
-          if (proceeds < entrySpent) losses++;
-          lastExitSeq = seq;
-          entryPrice = 0;
-          entryQty = 0n;
-          entrySpent = 0n;
-          entrySeq = -1;
-          peak = 0;
-          leg = null;
-        }
-      }
+    if (upBy(close, watch.low, TURN_BOUNCE_BPS)) {
+      watch.primed = false;
+      watch.spent = true;
+      everTraded = true;
+      trade = { openedAt: barIdx, winBps, loseBps, holdBars };
+      return { side: 'buy', symbol: ASSET, notional_quote_units: sizeQuote, max_slippage_bps: SLIPPAGE_CAP_BPS };
     }
-    pendingLeg = null;
+    return null;
+  }
+  if (downBy(close, high, dropBps)) {
+    watch.primed = true;
+    watch.low = close;
+  }
+  return null;
+}
 
-    const pos = state.positions.get(SYM);
-    const close = closes[closes.length - 1];
-    if (close === undefined) return [];
+// True when a live trade has hit its take-profit, its stop-loss, or its
+// time cap, measured against its own cost basis at the latest close.
+function shouldExit(
+  state: BarsState,
+  qty: bigint,
+  close: bigint,
+  openTrade: LiveTrade,
+): boolean {
+  const held = state.positions.get(ASSET);
+  if (held === undefined) return false;
+  const cost = held.cost;
+  const worth = state.value(ASSET, qty, close);
+  const won = worth * BPS >= cost * (BPS + openTrade.winBps);
+  const lost = worth * BPS <= cost * (BPS - openTrade.loseBps);
+  return won || lost;
+}
 
-    // --- holding: manage the exit ---
-    if (pos !== undefined && pos.qty > 0n) {
-      if (close > peak) peak = close;
-      const held = seq - entrySeq;
-      let exit = false;
-      if (leg === 'R') {
-        exit =
-          close >= entryPrice * (1 + R_TP) ||
-          close <= peak * (1 - R_TRAIL) ||
-          close <= entryPrice * (1 + R_SL) ||
-          held >= R_HOLD;
-      } else {
-        // leg I: take-profit, trail (which also caps a straight fall), hold
-        exit = close >= entryPrice * (1 + I_TP) || close <= peak * (1 - I_TRAIL) || held >= I_HOLD;
-      }
-      if (exit) {
-        return [{ side: 'sell', symbol: SYM, qty: pos.qty, max_slippage_bps: SLIP_BPS }];
-      }
-      return [];
-    }
+function onBatch(state: BarsState, _batch: Batch): OrderInput[] {
+  const close = state.close(ASSET);
+  if (close === null) return [];
+  history.push(close);
+  if (state.warmingUp) return [];
 
-    // --- flat: entry gates ---
-    if (seq < MIN_BAR || seq > LAST_ENTRY_BAR) return [];
-    if (losses >= MAX_LOSSES) return [];
-    if (seq - lastExitSeq < COOLDOWN) return [];
-    if (trades >= MAX_TRADES) return [];
+  const barIdx = state.seq - state.warmupBars;
+  const held = state.positions.get(ASSET);
+  const heldQty = held?.qty ?? 0n;
 
-    // Washout leg: 240-bar return <= -2% with price near the Donchian low.
-    // Index by closes.length, not seq: a minute with no bar must not shift
-    // the lookback (the race window may miss up to 28 minutes).
-    if (closes.length >= 241) {
-      const ret240 = close / closes[closes.length - 241] - 1;
-      const bounce = close / donchianLow(120) - 1;
-      if (ret240 <= R_RET240 && bounce >= R_BOUNCE_LO && bounce <= R_BOUNCE_HI) {
-        if (state.cash >= 1_000_000n) {
-          pendingLeg = 'R';
-          return [{ side: 'buy', symbol: SYM, notional_quote_units: state.cash, max_slippage_bps: SLIP_BPS }];
-        }
-      }
-    }
-
-    // Late insurance: no trade yet by bar 1080 -> buy 35% blind.
-    if (trades === 0 && fills === 0 && seq >= I_BAR) {
-      const amt = (state.cash * I_SIZE_NUM) / I_SIZE_DEN;
-      if (amt >= 1_000_000n) {
-        pendingLeg = 'I';
-        return [{ side: 'buy', symbol: SYM, notional_quote_units: amt, max_slippage_bps: SLIP_BPS }];
+  // We hold a position: sell on take-profit, stop-loss, or the time cap.
+  if (heldQty > 0n) {
+    if (trade !== null) {
+      const stale = barIdx - trade.openedAt >= trade.holdBars;
+      if (stale || shouldExit(state, heldQty, close, trade)) {
+        trade = null;
+        return [{ side: 'sell', symbol: ASSET, qty: heldQty, max_slippage_bps: SLIPPAGE_CAP_BPS }];
       }
     }
     return [];
-  },
-});
+  }
+
+  const high = recentHigh();
+  if (high === null) return [];
+
+  // Main rule: full-size buy on a sharp dip that turns.
+  const mainOrder = watchStep(
+    mainWatch,
+    close,
+    high,
+    PRIME_DROP_BPS,
+    state.cash,
+    WIN_BPS,
+    LOSE_BPS,
+    HOLD_LIMIT_BARS,
+    barIdx,
+  );
+  if (mainOrder !== null) return [mainOrder];
+
+  // Safety net: one small trade late in the window if nothing fired yet.
+  if (!everTraded && !netWatch.spent && barIdx >= NET_START_BAR) {
+    const size = state.cash < NET_SIZE_QUOTE ? state.cash : NET_SIZE_QUOTE;
+    const netOrder = watchStep(
+      netWatch,
+      close,
+      high,
+      NET_DROP_BPS,
+      size,
+      NET_WIN_BPS,
+      NET_LOSE_BPS,
+      NET_HOLD_BARS,
+      barIdx,
+    );
+    if (netOrder !== null) return [netOrder];
+  }
+
+  return [];
+}
+
+await runBars({ onBatch });
